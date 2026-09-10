@@ -1,0 +1,22 @@
+# Data — see data/README.md. Nothing derived from the source releases is committed.
+data/tiktoc/
+data/datashop-3458/
+*.pkl
+merged.pkl
+batch2.json
+existing_204.json
+items_264.json
+*.xlsx
+*.b64
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
