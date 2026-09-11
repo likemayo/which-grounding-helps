@@ -20,3 +20,17 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Student source code is not ours to redistribute (DataShop terms are granted
+# per user). The workbench HTML embeds the 264 annotated submissions verbatim.
+*.html
+annotation-workbench.html
+
+# Model outputs and the manuscript are results, not method.
+*.jsonl
+runs.jsonl
+main.tex
+main.pdf
+*.aux
+*.log
+*.out
