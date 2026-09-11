@@ -14,12 +14,10 @@ the join by roughly 4%. Adding normalized source resolves it exactly. The script
 asserts both the collision count and the final row count; if either fails to
 reproduce, it exits non-zero rather than writing a corpus you would then trust.
 
-Reconstructed from the interactive session that first produced merged.pkl.
-Run it once end to end and confirm the printed counts before relying on the output.
-
 Usage:  python src/merge_corpus.py
 Writes: merged.pkl
 """
+import re
 import sys
 from pathlib import Path
 
@@ -36,6 +34,12 @@ EXPECT_FAIL = 3951
 EXPECT_WRONG = 9131
 EXPECT_COLLISIONS = 801
 
+# Mean javac diagnostics per failed compile in the merged corpus. Lower than the
+# 2.24 of the full CodeWorkout export because tiktoc covers 17 of its 50 problems,
+# and failures on that subset are simpler. Verified against the raw export on all
+# 3,951 failing submissions: zero messages lost in the merge.
+EXPECT_MSGS_PER_FAIL = 1.414
+
 
 def norm(s: str) -> str:
     """Normalize source text for keying: strip trailing whitespace per line."""
@@ -43,7 +47,7 @@ def norm(s: str) -> str:
 
 
 def load_progsnap2(root: Path) -> pd.DataFrame:
-    """MainTable joined to CodeStates, one row per Run.Program event."""
+    """One row per submission, carrying ALL of its javac diagnostics."""
     main = root / "MainTable.csv"
     states = root / "CodeStates" / "CodeStates.csv"
     for p in (main, states):
@@ -53,26 +57,39 @@ def load_progsnap2(root: Path) -> pd.DataFrame:
     mt = pd.read_csv(main, low_memory=False)
     cs = pd.read_csv(states, low_memory=False)
 
-    mt = mt[mt.EventType == "Run.Program"].copy()
     mt = mt.merge(cs, on="CodeStateID", how="left")
-
     if "Code" not in mt.columns:
         sys.exit(f"CodeStates.csv has no 'Code' column; got {list(cs.columns)}")
 
-    keep = ["SubjectID", "ProblemID", "ServerTimestamp", "Code",
-            "CompileResult", "CompileMessageType", "CompileMessageData", "Score"]
-    mt = mt[[c for c in keep if c in mt.columns]]
-    return mt.rename(columns={"CompileResult": "compile_result"})
+    mt["ts"] = pd.to_datetime(mt["ServerTimestamp"], errors="coerce", utc=True)
+    mt["ck"] = mt["Code"].map(norm)
+    key = ["ProblemID", "ts", "ck"]
 
+    # One row per submission. These are NOT the only rows we need: a failed
+    # compilation is SEVERAL Compile.Error rows, and filtering to Run.Program
+    # before collecting them keeps at most one message per submission -- a defect
+    # that leaves every row count intact and is therefore invisible to a
+    # count-based sanity check.
+    subs = mt[mt.EventType == "Run.Program"].copy()
+    keep = ["SubjectID", "ProblemID", "ServerTimestamp", "ts", "ck", "Code",
+            "CodeStateID", "Score"]
+    subs = subs[[c for c in keep if c in subs.columns]].drop_duplicates(key)
 
-def collapse_messages(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per submission, with its javac messages joined into one field."""
-    if "CompileMessageData" not in df.columns:
-        df["compiler_output"] = None
-        return df
-    df = df.copy()
-    df["compiler_output"] = df["CompileMessageData"].fillna("").astype(str).str.strip()
-    return df
+    # All diagnostics for that submission, joined in event order.
+    err = mt[mt.EventType == "Compile.Error"].copy()
+    err["_msg"] = err["CompileMessageData"].fillna("").astype(str).str.strip()
+    err = err[err._msg != ""]
+    order_col = "Order" if "Order" in err.columns else "ts"
+    msgs = (err.sort_values(order_col)
+               .groupby(key, sort=False)["_msg"]
+               .apply(lambda s: ". ".join(s))
+               .rename("compiler_output")
+               .reset_index())
+
+    out = subs.merge(msgs, on=key, how="left")
+    out["compile_result"] = out.compiler_output.notna().map(
+        {True: "Error", False: "Success"})
+    return out
 
 
 def main() -> None:
@@ -81,13 +98,12 @@ def main() -> None:
                  "(the pickle needs `pip install javalang` to unpickle)")
 
     tk = pd.read_pickle(TIKTOC_PKL)
-    ps = collapse_messages(load_progsnap2(PS2))
+    ps = load_progsnap2(PS2)          # already carries ts, ck, compiler_output
     print(f"tiktoc rows: {len(tk):>7}")
-    print(f"ProgSnap2 Run.Program rows: {len(ps):>7}")
+    print(f"ProgSnap2 submissions: {len(ps):>7}")
 
-    for df in (tk, ps):
-        df["ts"] = pd.to_datetime(df["ServerTimestamp"], errors="coerce", utc=True)
-        df["ck"] = df["Code"].map(norm)
+    tk["ts"] = pd.to_datetime(tk["ServerTimestamp"], errors="coerce", utc=True)
+    tk["ck"] = tk["Code"].map(norm)
 
     # --- the collision the two-field key would hide -------------------------
     two = ps.duplicated(subset=["ProblemID", "ts"], keep=False)
@@ -128,6 +144,17 @@ def main() -> None:
     missing = m[(m.compile_result == "Error") & (m.compiler_output.fillna("") == "")]
     if len(missing):
         sys.exit(f"FAILED: {len(missing)} compile failures carry no javac message")
+
+    # The message-count check. Row counts stay correct when diagnostics are
+    # dropped, so this is the only assertion that catches it.
+    k = m[m.compile_result == "Error"].compiler_output.map(
+        lambda s: len(re.findall(r"error:", s or "")))
+    print(f"javac diagnostics per failed compile: mean {k.mean():.3f} "
+          f"(expected {EXPECT_MSGS_PER_FAIL}), median {int(k.median())}, "
+          f"max {int(k.max())}")
+    if abs(k.mean() - EXPECT_MSGS_PER_FAIL) > 0.05:
+        sys.exit("FAILED: diagnostics per failed compile does not reproduce -- "
+                 "most likely the Compile.Error rows were not all collected")
 
     m.drop(columns=["ck"]).to_pickle(OUT)
     print(f"\nwrote {OUT}")

@@ -50,12 +50,17 @@ problem within the same second — which inflates the join by roughly 4%. Adding
 text resolves it exactly.
 
 Result: **13,083** submissions carrying all three signals. 3,951 fail to compile; 9,131 compile and
-are still incorrect. Compiler messages are genuine `javac` output, averaging 2.22 messages per
-failed compilation.
+are still incorrect. Compiler messages are genuine `javac` output, averaging **1.41** diagnostics
+per failed compilation (median 1; 85% carry exactly one).
 
-### Two traps in the source data
+That figure is lower than the 2.24 of the full CodeWorkout export, and the difference is a property
+of the subset, not a loss in the merge: tiktoc covers 17 of CodeWorkout's 50 problems, and failures
+on those problems are simpler. This was checked submission by submission against the raw export —
+all 3,951 failing submissions matched, with zero diagnostics dropped.
 
-Both are checked programmatically; both cost a day to find.
+### Three traps in the source data
+
+Each is checked programmatically; each cost a day to find.
 
 **1. The test-case CSV is MySQL-escaped, not RFC 4180.** It uses `\"` where RFC 4180 uses `""`.
 `pandas.read_csv` raises `Expected 13 fields in line 212, saw 14`. The tempting fix,
@@ -66,7 +71,13 @@ index downstream. Correct parsing:
 csv.reader(fh, doublequote=False, escapechar="\\")
 ```
 
-**2. Row counts aligning does not mean contents align.** The correctness vector is positional
+**2. A failed compilation is several rows, not one.** In the ProgSnap2 export the submission is a
+`Run.Program` row and each diagnostic is a separate `Compile.Error` row. Filtering to `Run.Program`
+before collecting messages keeps at most one diagnostic per submission — and leaves every row count
+intact, so nothing downstream complains. `merge_corpus.py` groups the `Compile.Error` rows on the
+join key and asserts the resulting mean; that assertion is the only thing that catches this.
+
+**3. Row counts aligning does not mean contents align.** The correctness vector is positional
 against the ordered test-case table, so a count-based sanity check passes while the data is
 scrambled. `src/sample_batch2.py` pins two reference values (`P13#13`, `P40#1`) and exits if either
 fails to match, and index alignment was verified on all 12,139 candidate submissions with zero
