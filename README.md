@@ -188,9 +188,13 @@ that does not match, or a compilation failure missing its `javac` message will s
 Corpus merged and verified. Sampling complete. Codebook fixed. Annotation underway with a second
 annotator ([@Sophie-l-l](https://github.com/Sophie-l-l)).
 
-Model runs are in progress. Nothing here is a result: no agreement figure, no condition contrast
-and no κ is reported in this repository, and none should be inferred from it. Results belong to the
-paper.
+Model runs complete: two model families, 3,168 calls each — 264 items × 4 conditions × 3 repeated
+runs. `src/run_inference.py` asserts the three prompt invariants over all 264 items before the first
+paid call, and records the SHA-1 of every prompt it sends, so the byte-identity of C1 and C2 on
+compiling submissions is recoverable from the output rather than taken on trust.
+
+Nothing here is a result: no agreement figure, no condition contrast and no κ is reported in this
+repository, and none should be inferred from it. Results belong to the paper.
 
 ## License
 
