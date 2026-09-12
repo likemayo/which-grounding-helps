@@ -97,7 +97,18 @@ evidence.
 | **C1** | Student code |
 | **C2** | + compiler output (static evidence) |
 | **C3** | + problem statement |
-| **C4** | + per-test-case input, expected output, and pass/fail (execution evidence) |
+| **C4** | + per-test-case input, expected output, and outcome (execution evidence) |
+
+A submission that failed to compile was never executed, so it has no outcomes. Those items carry
+the test-case inputs and expected outputs marked `not executed (compilation failed)` — never a
+fabricated pass/fail vector. The zero vector that `binary_correctness` stores for an unrun
+submission is a default, not a result, and presenting it would tell the model the program ran and
+failed every case.
+
+**C2 adds nothing for a submission that compiles.** There is no diagnostic to supply, so for those
+206 of the 264 items the C1 and C2 prompts are byte-identical. That is deliberate rather than a
+defect: any label difference between two byte-identical prompts is the model's run-to-run
+variation, which gives the design a measured resolution floor instead of an assumed one.
 
 ---
 
@@ -177,8 +188,9 @@ that does not match, or a compilation failure missing its `javac` message will s
 Corpus merged and verified. Sampling complete. Codebook fixed. Annotation underway with a second
 annotator ([@Sophie-l-l](https://github.com/Sophie-l-l)).
 
-Nothing here is a result yet. The model runs have not been conducted; no agreement figure, no
-condition contrast, and no κ is reported in this repository, and none should be inferred from it.
+Model runs are in progress. Nothing here is a result: no agreement figure, no condition contrast
+and no κ is reported in this repository, and none should be inferred from it. Results belong to the
+paper.
 
 ## License
 

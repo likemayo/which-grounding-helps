@@ -37,10 +37,33 @@ import os
 import re
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
+
+# Providers enforce requests-per-minute limits that differ by account tier. A
+# single shared gate per provider keeps every worker under the ceiling instead
+# of discovering it through 429s.
+_GATES: dict[str, "RateGate"] = {}
+
+
+class RateGate:
+    def __init__(self, rpm: float):
+        self.interval = 60.0 / rpm if rpm > 0 else 0.0
+        self.lock = threading.Lock()
+        self.next_at = 0.0
+
+    def wait(self) -> None:
+        if not self.interval:
+            return
+        with self.lock:
+            now = time.monotonic()
+            sleep_for = max(0.0, self.next_at - now)
+            self.next_at = max(now, self.next_at) + self.interval
+        if sleep_for:
+            time.sleep(sleep_for)
 
 # ---------------------------------------------------------------- models
 
@@ -50,11 +73,22 @@ MODELS = {
         "in_per_m": 2.0,
         "out_per_m": 10.0,
     },
-    "gpt-5-6-terra": {
+    # Dated snapshot, and the closest price match to claude-sonnet-5 on the
+    # OpenAI side ($2/$8 against $2/$10). Newer OpenAI releases are rate-limited
+    # at this account's tier in ways that make a 3,168-call run impossible, and
+    # for an ablation whose object is the evidence rather than the model, a
+    # version that can be re-run later matters more than recency.
+    "gpt-4.1-2025-04-14": {       # verified against /v1/models 2026-09-11
         "provider": "openai",
-        "in_per_m": 2.50,
-        "out_per_m": 15.0,
+        "in_per_m": 2.0,
+        "out_per_m": 8.0,
     },
+    # Fallback second family, used when the OpenAI account tier cannot support
+    # a run of this size. Fill the ID from --list-models before use; prices from
+    # the provider's published table on the day of the run.
+    # "gemini-MODEL-ID": {"provider": "google",
+    #                     "in_per_m": 0.0, "out_per_m": 0.0},
+
     # optional third, weak-model contrast -- off by default
     # "claude-haiku-4-5-20251001": {"provider": "anthropic",
     #                               "in_per_m": 1.0, "out_per_m": 5.0},
@@ -240,7 +274,10 @@ def call_anthropic(model: str, prompt: str, timeout: int = 120) -> tuple[dict, d
         json={
             "model": model,
             "max_tokens": 512,
-            "temperature": 0,
+            # No temperature: it is deprecated on current Anthropic models.
+            # Determinism therefore comes from the provider default, which is
+            # why the three repeated runs per (item, condition) matter -- they
+            # measure the residual non-determinism rather than assume it away.
             "tools": [{
                 "name": "label",
                 "description": "Record the cognitive-cause label.",
@@ -295,7 +332,35 @@ def call_openai(model: str, prompt: str, timeout: int = 120) -> tuple[dict, dict
                               "out": usage.get("completion_tokens", 0)}
 
 
-CALLERS = {"anthropic": call_anthropic, "openai": call_openai}
+def call_google(model: str, prompt: str, timeout: int = 120) -> tuple[dict, dict]:
+    """Gemini structured output. Same schema, same prompt; only the wire format
+    differs, so the condition invariants are untouched."""
+    schema = json.loads(json.dumps(SCHEMA))
+    schema.pop("additionalProperties", None)          # not accepted here
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent",
+        headers={"x-goog-api-key": os.environ["GOOGLE_API_KEY"],
+                 "Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": schema,
+            },
+        },
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    body = r.json()
+    text = body["candidates"][0]["content"]["parts"][0]["text"]
+    u = body.get("usageMetadata", {})
+    return json.loads(text), {"in": u.get("promptTokenCount", 0),
+                              "out": u.get("candidatesTokenCount", 0)}
+
+
+CALLERS = {"anthropic": call_anthropic, "openai": call_openai,
+           "google": call_google}
 
 
 def valid(out) -> bool:
@@ -308,16 +373,37 @@ def valid(out) -> bool:
 # ------------------------------------------------------------------ runner
 
 
+def _retry_after(resp) -> float | None:
+    """Seconds to wait, from the header or from the message text."""
+    h = resp.headers.get("retry-after")
+    if h:
+        try:
+            return float(h)
+        except ValueError:
+            pass
+    m = re.search(r"try again in ([\d.]+)\s*(ms|s)\b", resp.text)
+    if m:
+        v = float(m.group(1))
+        return v / 1000 if m.group(2) == "ms" else v
+    return None
+
+
 def one_call(model: str, item: dict, cond: str, run: int) -> dict:
     prompt = build_prompt(item, cond)
-    caller = CALLERS[MODELS[model]["provider"]]
+    provider = MODELS[model]["provider"]
+    caller = CALLERS[provider]
+    gate = _GATES.get(provider)
     rec = {
         "model": model, "item_id": item["id"], "cond": cond, "run": run,
         "prompt_sha1": hashlib.sha1(prompt.encode()).hexdigest()[:12],
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # Neither provider exposes a dated snapshot at this tier, so the access
+        # date in `ts` is what pins the model version for the paper.
     }
-    for attempt in (1, 2):                 # retry once, then record the failure
+    for attempt in range(1, 7):            # rate limits deserve real patience
         try:
+            if gate:
+                gate.wait()
             out, usage = caller(model, prompt)
             rec["tokens_in"], rec["tokens_out"] = usage["in"], usage["out"]
             if valid(out):
@@ -325,8 +411,17 @@ def one_call(model: str, item: dict, cond: str, run: int) -> dict:
                 return rec
             rec["raw"] = json.dumps(out)[:500]
         except requests.HTTPError as e:
-            rec["error"] = f"http {e.response.status_code}: {e.response.text[:200]}"
-            if e.response.status_code in (429, 500, 502, 503, 529):
+            code = e.response.status_code
+            rec["error"] = f"http {code}: {e.response.text[:200]}"
+            if code == 429:
+                # A daily cap will not clear by waiting a few seconds. Say so
+                # rather than burning attempts against it.
+                if "per day" in e.response.text or "RPD" in e.response.text:
+                    rec["status"] = "rate_limited_daily"
+                    return rec
+                time.sleep(min(_retry_after(e.response) or 20.0, 60.0))
+                continue
+            if code in (500, 502, 503, 529):
                 time.sleep(5 * attempt)
                 continue
         except Exception as e:             # noqa: BLE001 -- record, do not drop
@@ -371,6 +466,52 @@ def report(out_path: Path) -> None:
         print(f"      labels: {dict(lab)}")
 
 
+def list_models() -> None:
+    """Ask each provider what this account can actually call."""
+    if os.environ.get("OPENAI_API_KEY"):
+        r = requests.get("https://api.openai.com/v1/models",
+                         headers={"Authorization":
+                                  f"Bearer {os.environ['OPENAI_API_KEY']}"},
+                         timeout=60)
+        r.raise_for_status()
+        ids = sorted(m["id"] for m in r.json()["data"])
+        print("OPENAI — chat-capable candidates:")
+        for i in ids:
+            if i.startswith("gpt") and not any(
+                    k in i for k in ("audio", "realtime", "image", "tts",
+                                     "transcribe", "embedding", "moderation",
+                                     "search", "instruct")):
+                print("   ", i)
+    else:
+        print("OPENAI_API_KEY not set")
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        r = requests.get("https://api.anthropic.com/v1/models",
+                         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                                  "anthropic-version": "2023-06-01"},
+                         params={"limit": 100}, timeout=60)
+        r.raise_for_status()
+        print("\nANTHROPIC:")
+        for m in r.json()["data"]:
+            print(f"    {m['id']:<40} {m.get('display_name','')}")
+    else:
+        print("\nANTHROPIC_API_KEY not set")
+
+    if os.environ.get("GOOGLE_API_KEY"):
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": os.environ["GOOGLE_API_KEY"]},
+            timeout=60)
+        r.raise_for_status()
+        print("\nGOOGLE — models supporting generateContent:")
+        for m in r.json().get("models", []):
+            if "generateContent" in m.get("supportedGenerationMethods", []):
+                print(f"    {m['name'].replace('models/', ''):<40} "
+                      f"{m.get('displayName','')}")
+    else:
+        print("\nGOOGLE_API_KEY not set")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workbench", type=Path,
@@ -381,9 +522,20 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0,
                     help="only the first N items (pilot)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--openai-rpm", type=float, default=3,
+                    help="requests/min ceiling for OpenAI; raise after a tier "
+                         "upgrade (see platform.openai.com/settings/organization/limits)")
+    ap.add_argument("--anthropic-rpm", type=float, default=50)
+    ap.add_argument("--google-rpm", type=float, default=60)
     ap.add_argument("--check-only", action="store_true")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--list-models", action="store_true",
+                    help="ask both providers what IDs this account can call")
     a = ap.parse_args()
+
+    if a.list_models:
+        list_models()
+        return
 
     if a.report:
         report(a.out)
@@ -396,11 +548,16 @@ def main() -> None:
     if a.limit:
         items = items[:a.limit]
 
+    ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
+           "google": "GOOGLE_API_KEY"}
     for m in a.models:
-        env = "ANTHROPIC_API_KEY" if MODELS[m]["provider"] == "anthropic" \
-              else "OPENAI_API_KEY"
+        env = ENV[MODELS[m]["provider"]]
         if not os.environ.get(env):
             sys.exit(f"{env} is not set (needed for {m})")
+
+    _GATES["openai"] = RateGate(a.openai_rpm)
+    _GATES["anthropic"] = RateGate(a.anthropic_rpm)
+    _GATES["google"] = RateGate(a.google_rpm)
 
     done = done_keys(a.out)
     jobs = [(m, it, c, r)

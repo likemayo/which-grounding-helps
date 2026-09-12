@@ -1,3 +1,4 @@
 pandas>=2.0
 openpyxl>=3.1
 javalang>=0.13        # required to unpickle the tiktoc release
+requests>=2.31       # required by src/run_inference.py
