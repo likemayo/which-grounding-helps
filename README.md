@@ -16,13 +16,35 @@ address the misconception rather than the symptom. Such systems are given whatev
 convenient: sometimes only the code, sometimes the compiler output, sometimes the full problem
 specification and test results.
 
-Whether these forms of evidence are interchangeable is not established. They are treated as if
-more context were uniformly better.
+These choices are made for reasons of convenience and are rarely treated as a variable.
 
-**RQ.** How does the reliability of an LLM's inference about the *cognitive cause* of a programming
-error change as the evidence available to it is increased?
+**We do not ask whether grounding helps.** Relevant evidence raising accuracy is neither surprising
+nor, on its own, useful to anyone building such a system. Three questions the monotone intuition
+does not answer:
 
-**H1 (asymmetry).** The benefit of additional grounding depends on the error type. Compiler output
+1. **Does more evidence ever make attribution worse?** Evidence does not only inform; it suggests.
+   `SPEC_MISREADING` is defined as code that cleanly implements a coherent rule other than the
+   specified one — and the moment a model is shown the specification, that becomes the cheapest
+   available explanation for any divergence.
+2. **Is the gain worth its cost?** Compiler output is a by-product of compilation. Executing a
+   submission against a test suite requires a sandbox and an execution budget. A designer needs to
+   know not that execution evidence helps but whether it helps *enough*, for which error types, and
+   whether cheaper static evidence recovers most of the benefit.
+3. **Does the model become more accurate, or merely more confident?** `INDETERMINATE` is a
+   substantive category here. A model that withholds judgment less often as evidence accumulates,
+   without becoming correspondingly more correct, has become worse: in a deployed system that
+   converts silence into a confident wrong explanation delivered to a student.
+
+**One asymmetry is definitional, and is marked as such.** A submission that compiles has no
+compiler diagnostic, so C2 supplies nothing for it and is textually identical to C1. The absence of
+an effect there is a property of the construction, not a finding, and it is reported as a
+manipulation check rather than as a result — see the note under [Conditions](#conditions). The
+empirical questions in that contrast are whether compiler output helps *where it exists*, which is
+not obvious given that the codebook explicitly forbids mapping a diagnostic class onto a cause and
+85% of failed compilations carry a single line, and whether the ordering of evidence value is the
+same across failure modes.
+
+**H1 (asymmetry), pre-registered before any model output was generated.** The benefit of additional grounding depends on the error type. Compiler output
 should substantially improve inference for submissions that fail to compile, and contribute close to
 nothing for submissions that compile and produce an incorrect result — because for the latter there
 is no compiler message to add. For those, only execution evidence carries information.
